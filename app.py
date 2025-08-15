@@ -1,4 +1,5 @@
 import io
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -37,13 +38,38 @@ def infer_col(df, must_have=(), any_of=()):
     return None
 
 def find_col(df, target):
-    """Case-insensitive, collapses multiple spaces; returns actual column name or None."""
+    """Case-insensitive, collapses spaces; returns actual column name or None."""
     t = " ".join(str(target).strip().lower().split())
     for c in df.columns:
         cand = " ".join(str(c).strip().lower().split())
         if cand == t:
             return c
     return None
+
+def coerce_numeric(series):
+    """
+    Make messy numeric columns usable:
+      - strips text/units ('kg', 'm', etc.)
+      - handles '1,75' vs '1.75'
+      - removes thousand separators
+    """
+    s = series.astype(str).str.strip()
+
+    # convert decimal comma to dot when no dot present
+    has_comma = s.str.contains(r",").fillna(False)
+    has_dot = s.str.contains(r"\.").fillna(False)
+    s = s.mask(has_comma & ~has_dot, s.str.replace(",", ".", regex=False))
+
+    # remove thousands separators (commas) when dots also present
+    s = s.str.replace(r"(?<=\d),(?=\d{3}\b)", "", regex=True)
+
+    # keep digits, minus, dot
+    s = s.str.replace(r"[^0-9\.\-]", "", regex=True)
+
+    # collapse multiple dots to first
+    s = s.str.replace(r"(?<=\d)\.(?=.*\.)", "", regex=True)
+
+    return pd.to_numeric(s, errors="coerce")
 
 def cliffs_delta(a, b):
     a, b = np.asarray(a), np.asarray(b)
@@ -67,14 +93,12 @@ def build_long_from_input(df, visits):
             infer_col(df, ("subject","id")) or infer_col(df, ("id",)) or "Subject")
     grp  = infer_col(df, ("group",)) or "Group"
 
-    # Baseline can be "Baseline", "Baseline IPSS Total Score", etc.
     base = (infer_col(df, ("baseline",)) or infer_col(df, ("base",)) or
             infer_col(df, ("bl_",)) or infer_col(df, ("bl ",)) or
             infer_col(df, (" bl",)) or infer_col(df, ("bl",)))
     if not base:
         return None, None, None, "Baseline column not found (e.g., 'Baseline IPSS Total Score')."
 
-    # Visit columns: match by visit token regardless of metric text
     visit_map = {}
     for v in visits:
         aliases = [v.lower(), v.lower().replace("day","day ")]
@@ -91,7 +115,7 @@ def build_long_from_input(df, visits):
     inp.columns = ["Subject","Group","Baseline"] + visits
     inp["Group"] = inp["Group"].astype(str).str.strip()
 
-    # force numeric
+    # numeric
     for c in ["Baseline"] + visits:
         inp[c] = pd.to_numeric(inp[c], errors="coerce")
 
@@ -100,13 +124,12 @@ def build_long_from_input(df, visits):
     for v in visits:
         chg_wide[f"{v}_change"] = inp[v] - inp["Baseline"]
 
-    # long
     rows = []
     for _, r in chg_wide.iterrows():
-        for v in visits:
-            val = r.get(f"{v}_change")
+        for vv in visits:
+            val = r.get(f"{vv}_change")
             if pd.notna(val):
-                rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": v, "Change": float(val)})
+                rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": vv, "Change": float(val)})
     long_change = pd.DataFrame(rows)
     if long_change.empty:
         return None, None, None, "No change values computed (non-numeric inputs?)."
@@ -154,37 +177,36 @@ def build_long_from_changewide(df, visits):
     long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
     return long_change, use, None
 
-# ---------- Filters UI ----------
+# ---------- Filters UI (with debug + robust numeric) ----------
 def build_filter_ui(input_echo, change_wide, visits):
     """
     Returns: filter_info (list of dict), groups_selected (list), subject_set (set or None).
-    Supports:
-      • Group (multi-select)
-      • Status (multi-select, if present)
-      • Numeric ranges for: Age, Weight in kg, Height in metres, BMI (if present)
+    Shows a 'Filter debug' box so you can see what was detected.
     """
     df_cov = input_echo if input_echo is not None and not input_echo.empty else None
 
-    # groups present
+    # Which groups are present?
     if df_cov is not None:
         all_groups = sorted(df_cov["Group"].dropna().astype(str).str.strip().unique().tolist())
+        mode = "RAW (Input)"
     else:
         all_groups = sorted(change_wide["Group"].dropna().astype(str).str.strip().unique().tolist())
+        mode = "CHANGE (Change Wide)"
 
     with st.sidebar.expander("Filters (optional)"):
-        # --- Groups ---
         groups_selected = st.multiselect("Groups to include", all_groups, default=all_groups)
 
         filter_info = [{"Field": "Group", "Rule": ", ".join(groups_selected) if groups_selected else "(none)"}]
 
         if df_cov is None:
-            st.caption("No Input sheet detected → covariate filters disabled (use only group filter).")
+            st.caption("No **Input** sheet detected → covariate sliders disabled (group filter only).")
+            st.info(f"Detection mode: {mode}")
             return filter_info, groups_selected, None
 
         df = df_cov.copy()
         df["Group"] = df["Group"].astype(str).str.strip()
 
-        # --- Status (categorical) ---
+        # ——— Status (categorical) ———
         status_col = find_col(df, "Status")
         status_selected = None
         if status_col is not None:
@@ -193,22 +215,26 @@ def build_filter_ui(input_echo, change_wide, visits):
             if status_selected:
                 filter_info.append({"Field": "Status", "Rule": ", ".join(status_selected)})
 
-        # --- Numeric covariates ---
+        # ——— Numeric covariates ———
         numeric_targets = ["Age", "Weight in kg", "Height in metres", "BMI"]
         slider_rules = {}
+        detected_cols = {}
         for tgt in numeric_targets:
             col = find_col(df, tgt)
             if col is None:
+                detected_cols[tgt] = "(missing)"
                 continue
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            if df[col].notna().sum() == 0:
+            num = coerce_numeric(df[col])
+            detected_cols[tgt] = f"found ({num.notna().sum()} numeric)"
+            if num.notna().sum() == 0:
                 continue
-            lo, hi = float(np.nanmin(df[col])), float(np.nanmax(df[col]))
+            lo, hi = float(np.nanmin(num)), float(np.nanmax(num))
             a, b = st.slider(f"{tgt} range", min_value=lo, max_value=hi, value=(lo, hi))
+            df[col] = num  # store cleaned numeric
             slider_rules[col] = (a, b)
             filter_info.append({"Field": tgt, "Rule": f"{a} ≤ {tgt} ≤ {b}"})
 
-        # Subject set passing all filters
+        # Build subject set that passes all filters
         mask = df["Group"].isin(groups_selected)
         if status_col is not None and status_selected is not None and len(status_selected) > 0:
             mask &= df[status_col].astype(str).str.strip().isin(status_selected)
@@ -216,7 +242,15 @@ def build_filter_ui(input_echo, change_wide, visits):
             mask &= df[col].between(a, b, inclusive="both")
 
         subject_set = set(df.loc[mask, "Subject"].astype(str))
-        return filter_info, groups_selected, subject_set
+
+    # Debug panel
+    with st.sidebar.expander("Filter debug"):
+        st.write(f"Detection mode: **{mode}**")
+        dbg = {"Status": "found" if status_col is not None else "(missing)"}
+        dbg.update(detected_cols)
+        st.json(dbg)
+
+    return filter_info, groups_selected, subject_set
 
 def apply_filters(long_change, change_wide, input_echo, groups_selected, subject_set):
     def _apply_long(df_long):
@@ -426,7 +460,7 @@ if uploaded:
     long_change = None; change_wide = None; input_echo = None
     used_mode = None; used_sheet = None
 
-    # Try Change Wide
+    # Try Change Wide first
     for s in xl.sheet_names:
         try:
             df = pd.read_excel(uploaded, sheet_name=s)
@@ -436,7 +470,7 @@ if uploaded:
         except Exception:
             pass
 
-    # Try Input
+    # Try Input if Change Wide not found
     if long_change is None:
         for s in xl.sheet_names:
             try:
@@ -453,7 +487,7 @@ if uploaded:
     st.success(f"Detected: **{used_mode}** on sheet **{used_sheet}**")
 
     # === Filters ===
-    filter_info, groups_selected, subject_set = build_filter_ui(input_echo, change_wide, DEFAULT_VISITS if not VISITS else VISITS)
+    filter_info, groups_selected, subject_set = build_filter_ui(input_echo, change_wide, VISITS)
 
     # Apply to data
     def _apply_filters_long(df_long):
@@ -481,7 +515,7 @@ if uploaded:
 
     st.info(f"Filtered cohort: {long_change['Subject'].nunique()} subjects; groups kept: {', '.join(groups_selected)}")
 
-    # Available groups after filtering (default to Placebo vs USPlus if available)
+    # Available groups (default Placebo vs USPlus if present)
     all_groups = sorted(long_change["Group"].dropna().astype(str).str.strip().unique().tolist())
     preferred = [g for g in ["USPlus", "Placebo"] if g in all_groups]
     if len(preferred) == 2:
@@ -493,7 +527,7 @@ if uploaded:
         st.markdown("### Pairwise comparison")
         group_a = st.selectbox("Group A", all_groups, index=all_groups.index(default_a))
         group_b = st.selectbox("Group B", all_groups, index=all_groups.index(default_b))
-        # To lock these two, replace the two lines above with:
+        # To lock comparison: uncomment next line and remove the two selectboxes
         # group_a, group_b = "Placebo", "USPlus"
 
     st.subheader("2) Preview (long-format change)")
@@ -564,9 +598,6 @@ if uploaded:
         ttests_df.to_excel(writer, sheet_name="TTESTS_PAIR", index=False)
 
         # Filters used
-        filters_df = pd.DataFrame(build_filter_ui.__defaults__ or [])
-        # The above is a placeholder; better: rebuild from earlier call.
-        # We'll reuse the filter_info we already created:
         try:
             filters_df = pd.DataFrame(filter_info)
         except Exception:
