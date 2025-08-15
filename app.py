@@ -9,6 +9,7 @@ from statsmodels.stats.anova import anova_lm
 
 st.set_page_config(page_title="Nonparametric Clinical Stats — Filters + Pairwise + RM", layout="wide")
 st.title("Nonparametric Clinical Analysis (with Filters)")
+
 st.caption(
     "Upload an Excel with either an **Input** sheet (Subject, Group, Baseline, Day 28/56/84, "
     "optional covariates: Status, Age, Weight in kg, Height in metres, BMI) or a **Change Wide** sheet "
@@ -35,6 +36,15 @@ def infer_col(df, must_have=(), any_of=()):
             return c
     return None
 
+def find_col(df, target):
+    """Case-insensitive, collapses multiple spaces; returns actual column name or None."""
+    t = " ".join(str(target).strip().lower().split())
+    for c in df.columns:
+        cand = " ".join(str(c).strip().lower().split())
+        if cand == t:
+            return c
+    return None
+
 def cliffs_delta(a, b):
     a, b = np.asarray(a), np.asarray(b)
     m, n = len(a), len(b)
@@ -56,12 +66,15 @@ def build_long_from_input(df, visits):
     subj = (infer_col(df, ("subject",)) or infer_col(df, ("participant","id")) or
             infer_col(df, ("subject","id")) or infer_col(df, ("id",)) or "Subject")
     grp  = infer_col(df, ("group",)) or "Group"
+
+    # Baseline can be "Baseline", "Baseline IPSS Total Score", etc.
     base = (infer_col(df, ("baseline",)) or infer_col(df, ("base",)) or
             infer_col(df, ("bl_",)) or infer_col(df, ("bl ",)) or
             infer_col(df, (" bl",)) or infer_col(df, ("bl",)))
     if not base:
-        return None, None, None, "Baseline column not found (baseline/base/BL_)."
+        return None, None, None, "Baseline column not found (e.g., 'Baseline IPSS Total Score')."
 
+    # Visit columns: match by visit token regardless of metric text
     visit_map = {}
     for v in visits:
         aliases = [v.lower(), v.lower().replace("day","day ")]
@@ -172,7 +185,7 @@ def build_filter_ui(input_echo, change_wide, visits):
         df["Group"] = df["Group"].astype(str).str.strip()
 
         # --- Status (categorical) ---
-        status_col = next((c for c in df.columns if str(c).strip().lower() == "status"), None)
+        status_col = find_col(df, "Status")
         status_selected = None
         if status_col is not None:
             levels = sorted(df[status_col].dropna().astype(str).str.strip().unique().tolist())
@@ -184,7 +197,7 @@ def build_filter_ui(input_echo, change_wide, visits):
         numeric_targets = ["Age", "Weight in kg", "Height in metres", "BMI"]
         slider_rules = {}
         for tgt in numeric_targets:
-            col = next((c for c in df.columns if str(c).strip().lower() == tgt.lower()), None)
+            col = find_col(df, tgt)
             if col is None:
                 continue
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -440,7 +453,7 @@ if uploaded:
     st.success(f"Detected: **{used_mode}** on sheet **{used_sheet}**")
 
     # === Filters ===
-    filter_info, groups_selected, subject_set = build_filter_ui(input_echo, change_wide, VISITS)
+    filter_info, groups_selected, subject_set = build_filter_ui(input_echo, change_wide, DEFAULT_VISITS if not VISITS else VISITS)
 
     # Apply to data
     def _apply_filters_long(df_long):
@@ -466,18 +479,22 @@ if uploaded:
     if input_echo is not None and not input_echo.empty:
         input_echo = _apply_filters_wide(input_echo)
 
-    st.info(f"Filtered cohort: {long_change['Subject'].nunique()} subjects; groups: {', '.join(groups_selected)}")
+    st.info(f"Filtered cohort: {long_change['Subject'].nunique()} subjects; groups kept: {', '.join(groups_selected)}")
 
-    # Available groups after filtering
+    # Available groups after filtering (default to Placebo vs USPlus if available)
     all_groups = sorted(long_change["Group"].dropna().astype(str).str.strip().unique().tolist())
+    preferred = [g for g in ["USPlus", "Placebo"] if g in all_groups]
+    if len(preferred) == 2:
+        default_a, default_b = "Placebo", "USPlus"
+    else:
+        default_a, default_b = all_groups[0], (all_groups[1] if len(all_groups) > 1 else all_groups[0])
+
     with st.sidebar:
-        st.markdown("### Pairwise comparison (pick two groups)")
-        if len(all_groups) < 2:
-            st.error("Need at least two groups after filtering."); st.stop()
-        group_a = st.selectbox("Group A", all_groups, index=0)
-        group_b = st.selectbox("Group B", all_groups, index=1 if len(all_groups) > 1 else 0)
-        if group_a == group_b:
-            st.warning("Pick two different groups for pairwise tests.")
+        st.markdown("### Pairwise comparison")
+        group_a = st.selectbox("Group A", all_groups, index=all_groups.index(default_a))
+        group_b = st.selectbox("Group B", all_groups, index=all_groups.index(default_b))
+        # To lock these two, replace the two lines above with:
+        # group_a, group_b = "Placebo", "USPlus"
 
     st.subheader("2) Preview (long-format change)")
     st.dataframe(long_change.head(10))
@@ -547,7 +564,13 @@ if uploaded:
         ttests_df.to_excel(writer, sheet_name="TTESTS_PAIR", index=False)
 
         # Filters used
-        filters_df = pd.DataFrame(filter_info)
+        filters_df = pd.DataFrame(build_filter_ui.__defaults__ or [])
+        # The above is a placeholder; better: rebuild from earlier call.
+        # We'll reuse the filter_info we already created:
+        try:
+            filters_df = pd.DataFrame(filter_info)
+        except Exception:
+            filters_df = pd.DataFrame([{"Field":"(error)","Rule":"Could not serialize filters"}])
         filters_df.to_excel(writer, sheet_name="FILTERS_APPLIED", index=False)
 
         # Chart
