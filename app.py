@@ -8,11 +8,12 @@ from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
 
 st.set_page_config(page_title="Nonparametric Clinical Stats — Filters + Pairwise + RM", layout="wide")
-st.title("Nonparametric Clinical Analysis")
+st.title("Nonparametric Clinical Analysis (with Filters)")
 st.caption(
-    "Upload an Excel with either an **Input** sheet (Subject, Group, Baseline, Day 28/56/84, optional covariates like BMI/Age/Weight/Height) "
-    "or a **Change Wide** sheet (Subject, Group, Day28_change/Day56_change/Day84_change). "
-    "Select two groups for **pairwise** tests; **RM** runs across all groups. Optional **Filters** let you subset by covariates (e.g., BMI < 40)."
+    "Upload an Excel with either an **Input** sheet (Subject, Group, Baseline, Day 28/56/84, "
+    "optional covariates: Status, Age, Weight in kg, Height in metres, BMI) or a **Change Wide** sheet "
+    "(Subject, Group, Day28_change/Day56_change/Day84_change). Use the **Filters** panel to subset; "
+    "pairwise tests run on the selected two groups, repeated-measures runs across all groups."
 )
 
 # ------------------ Settings ------------------
@@ -75,7 +76,6 @@ def build_long_from_input(df, visits):
 
     inp = df[[subj, grp, base] + list(visit_map.values())].copy()
     inp.columns = ["Subject","Group","Baseline"] + visits
-    # normalize group labels (trim only; keep original names)
     inp["Group"] = inp["Group"].astype(str).str.strip()
 
     # force numeric
@@ -144,49 +144,65 @@ def build_long_from_changewide(df, visits):
 # ---------- Filters UI ----------
 def build_filter_ui(input_echo, change_wide, visits):
     """
-    Returns: filter_info (list of dict), groups_selected (list), subject_set (set or None)
-    - When Input is available: detect numeric covariates and offer sliders.
-    - When only Change Wide is available: allow group selection only.
+    Returns: filter_info (list of dict), groups_selected (list), subject_set (set or None).
+    Supports:
+      • Group (multi-select)
+      • Status (multi-select, if present)
+      • Numeric ranges for: Age, Weight in kg, Height in metres, BMI (if present)
     """
     df_cov = input_echo if input_echo is not None and not input_echo.empty else None
 
     # groups present
-    if input_echo is not None and not input_echo.empty:
-        all_groups = sorted(input_echo["Group"].dropna().astype(str).str.strip().unique().tolist())
+    if df_cov is not None:
+        all_groups = sorted(df_cov["Group"].dropna().astype(str).str.strip().unique().tolist())
     else:
         all_groups = sorted(change_wide["Group"].dropna().astype(str).str.strip().unique().tolist())
 
     with st.sidebar.expander("Filters (optional)"):
+        # --- Groups ---
         groups_selected = st.multiselect("Groups to include", all_groups, default=all_groups)
 
-        cov_numeric = []
-        if df_cov is not None:
-            non_cov = {"Subject","Group","Baseline"}
-            non_cov.update(visits)
-            maybe_cov = [c for c in df_cov.columns if c not in non_cov]
-            cov_numeric = [c for c in maybe_cov if pd.api.types.is_numeric_dtype(df_cov[c])]
+        filter_info = [{"Field": "Group", "Rule": ", ".join(groups_selected) if groups_selected else "(none)"}]
 
-        filter_info = []
-        sliders = {}
-        if df_cov is None or len(cov_numeric) == 0:
-            st.caption("No numeric covariates detected in Input sheet (range filters disabled).")
-        else:
-            pick = st.multiselect("Numeric covariates to filter", cov_numeric, default=[])
-            for c in pick:
-                series = pd.to_numeric(df_cov[c], errors="coerce")
-                lo, hi = float(np.nanmin(series)), float(np.nanmax(series))
-                a, b = st.slider(f"{c} range", min_value=lo, max_value=hi, value=(lo, hi))
-                sliders[c] = (a, b)
-                filter_info.append({"Field": c, "Rule": f"{a} ≤ {c} ≤ {b}"})
+        if df_cov is None:
+            st.caption("No Input sheet detected → covariate filters disabled (use only group filter).")
+            return filter_info, groups_selected, None
 
-        subject_set = None
-        if df_cov is not None:
-            mask = df_cov["Group"].astype(str).str.strip().isin(groups_selected)
-            for c, (a, b) in sliders.items():
-                mask &= df_cov[c].between(a, b, inclusive="both")
-            subject_set = set(df_cov.loc[mask, "Subject"].astype(str))
+        df = df_cov.copy()
+        df["Group"] = df["Group"].astype(str).str.strip()
 
-        filter_info.insert(0, {"Field": "Group", "Rule": ", ".join(groups_selected) if groups_selected else "(none)"})
+        # --- Status (categorical) ---
+        status_col = next((c for c in df.columns if str(c).strip().lower() == "status"), None)
+        status_selected = None
+        if status_col is not None:
+            levels = sorted(df[status_col].dropna().astype(str).str.strip().unique().tolist())
+            status_selected = st.multiselect("Status (optional)", levels, default=levels)
+            if status_selected:
+                filter_info.append({"Field": "Status", "Rule": ", ".join(status_selected)})
+
+        # --- Numeric covariates ---
+        numeric_targets = ["Age", "Weight in kg", "Height in metres", "BMI"]
+        slider_rules = {}
+        for tgt in numeric_targets:
+            col = next((c for c in df.columns if str(c).strip().lower() == tgt.lower()), None)
+            if col is None:
+                continue
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if df[col].notna().sum() == 0:
+                continue
+            lo, hi = float(np.nanmin(df[col])), float(np.nanmax(df[col]))
+            a, b = st.slider(f"{tgt} range", min_value=lo, max_value=hi, value=(lo, hi))
+            slider_rules[col] = (a, b)
+            filter_info.append({"Field": tgt, "Rule": f"{a} ≤ {tgt} ≤ {b}"})
+
+        # Subject set passing all filters
+        mask = df["Group"].isin(groups_selected)
+        if status_col is not None and status_selected is not None and len(status_selected) > 0:
+            mask &= df[status_col].astype(str).str.strip().isin(status_selected)
+        for col, (a, b) in slider_rules.items():
+            mask &= df[col].between(a, b, inclusive="both")
+
+        subject_set = set(df.loc[mask, "Subject"].astype(str))
         return filter_info, groups_selected, subject_set
 
 def apply_filters(long_change, change_wide, input_echo, groups_selected, subject_set):
@@ -215,7 +231,6 @@ def apply_filters(long_change, change_wide, input_echo, groups_selected, subject
 
 # ---------- Core stats ----------
 def compute_rm_all_groups(long_change, visits):
-    """RM across ALL groups (Group, Time, Interaction)."""
     lc = long_change.copy()
     lc["Change"] = pd.to_numeric(lc["Change"], errors="coerce")
     lc = lc.dropna(subset=["Group","Time","Change"]).copy()
@@ -240,13 +255,11 @@ def compute_rm_all_groups(long_change, visits):
     return rm_df, observed
 
 def compute_pairwise_between(long_change, visits, group_a, group_b):
-    """Between-group tests (MWU, BM, Welch) for a selected pair, per visit, and Summary for chart."""
     lc = long_change[long_change["Group"].isin([group_a, group_b])].copy()
     lc["Change"] = pd.to_numeric(lc["Change"], errors="coerce")
     lc = lc.dropna(subset=["Change","Time","Group"]).copy()
 
-    valid = []
-    diag = []
+    valid, diag = [], []
     for v in [vv for vv in visits if vv in lc["Time"].astype(str).unique().tolist()]:
         nA = lc[(lc["Time"]==v) & (lc["Group"]==group_a)]["Change"].notna().sum()
         nB = lc[(lc["Time"]==v) & (lc["Group"]==group_b)]["Change"].notna().sum()
@@ -254,8 +267,7 @@ def compute_pairwise_between(long_change, visits, group_a, group_b):
         diag.append({"Visit": v, f"N {group_a}": int(nA), f"N {group_b}": int(nB),
                      "Status": "kept" if (nA>0 and nB>0) else "dropped: need both groups"})
 
-    rows = []
-    sumrows = []
+    rows, sumrows = [], []
     for v in valid:
         a = lc[(lc["Time"]==v) & (lc["Group"]==group_a)]["Change"]
         b = lc[(lc["Time"]==v) & (lc["Group"]==group_b)]["Change"]
@@ -268,7 +280,6 @@ def compute_pairwise_between(long_change, visits, group_a, group_b):
 
         d = cliffs_delta(a, b) if len(a)>0 and len(b)>0 else np.nan
         hl = hodges_lehmann(a, b) if len(a)>0 and len(b)>0 else np.nan
-
         r_rb = np.nan
         if len(a)>0 and len(b)>0 and not np.isnan(U):
             r_rb = 1 - 2 * U / (len(a)*len(b))
@@ -303,13 +314,9 @@ def compute_pairwise_between(long_change, visits, group_a, group_b):
             f"{group_b}_plus": bplus, f"{group_b}_minus": bminus
         })
 
-    pv_df = pd.DataFrame(rows)
-    summary_df = pd.DataFrame(sumrows)
-    diag_df = pd.DataFrame(diag)
-    return pv_df, summary_df, valid, diag_df
+    return pd.DataFrame(rows), pd.DataFrame(sumrows), valid, pd.DataFrame(diag)
 
 def compute_within_group_tests(input_echo, visits):
-    """Within-group (Baseline vs each visit) for ALL groups present."""
     if input_echo is None or input_echo.empty:
         return pd.DataFrame()
     groups = sorted(input_echo["Group"].dropna().astype(str).str.strip().unique().tolist())
@@ -413,7 +420,8 @@ if uploaded:
             lc, chg_wide, err = build_long_from_changewide(df, VISITS)
             if lc is not None and err is None and not lc.empty:
                 long_change = lc; change_wide = chg_wide; used_mode, used_sheet = "CHANGE", s; break
-        except Exception: pass
+        except Exception:
+            pass
 
     # Try Input
     if long_change is None:
@@ -423,7 +431,8 @@ if uploaded:
                 lc, chg_wide, inp, err = build_long_from_input(df, VISITS)
                 if lc is not None and err is None and not lc.empty:
                     long_change = lc; change_wide = chg_wide; input_echo = inp; used_mode, used_sheet = "RAW", s; break
-            except Exception: pass
+            except Exception:
+                pass
 
     if long_change is None or long_change.empty:
         st.error("Could not auto-detect a usable sheet."); st.stop()
@@ -432,8 +441,32 @@ if uploaded:
 
     # === Filters ===
     filter_info, groups_selected, subject_set = build_filter_ui(input_echo, change_wide, VISITS)
-    long_change, change_wide, input_echo = apply_filters(long_change, change_wide, input_echo, groups_selected, subject_set)
-    st.info(f"Filtered cohort: {long_change['Subject'].nunique()} subjects, {len(groups_selected)} group(s).")
+
+    # Apply to data
+    def _apply_filters_long(df_long):
+        out = df_long.copy()
+        out["Group"] = out["Group"].astype(str).str.strip()
+        out = out[out["Group"].isin(groups_selected)]
+        if subject_set is not None:
+            out["Subject"] = out["Subject"].astype(str)
+            out = out[out["Subject"].isin(subject_set)]
+        return out
+
+    def _apply_filters_wide(df_wide):
+        out = df_wide.copy()
+        out["Group"] = out["Group"].astype(str).str.strip()
+        out = out[out["Group"].isin(groups_selected)]
+        if subject_set is not None and "Subject" in out.columns:
+            out["Subject"] = out["Subject"].astype(str)
+            out = out[out["Subject"].isin(subject_set)]
+        return out
+
+    long_change = _apply_filters_long(long_change)
+    change_wide  = _apply_filters_wide(change_wide)
+    if input_echo is not None and not input_echo.empty:
+        input_echo = _apply_filters_wide(input_echo)
+
+    st.info(f"Filtered cohort: {long_change['Subject'].nunique()} subjects; groups: {', '.join(groups_selected)}")
 
     # Available groups after filtering
     all_groups = sorted(long_change["Group"].dropna().astype(str).str.strip().unique().tolist())
@@ -449,12 +482,12 @@ if uploaded:
     st.subheader("2) Preview (long-format change)")
     st.dataframe(long_change.head(10))
 
-    # RM across ALL groups
+    # Repeated-measures across ALL groups
     st.subheader("3) Repeated-measures across ALL groups")
     rm_df, observed = compute_rm_all_groups(long_change, VISITS)
     st.dataframe(rm_df)
 
-    # Pairwise between-group tests
+    # Pairwise tests
     st.subheader(f"4) Pairwise between-group tests — {group_a} vs {group_b}")
     pv_df, summary_df, valid_visits, diag_df = compute_pairwise_between(long_change, VISITS, group_a, group_b)
     st.markdown("**P_VALUES (per visit: Mann–Whitney, Brunner–Munzel, effect sizes)**")
@@ -463,7 +496,7 @@ if uploaded:
     with st.expander("Diagnostics (per-visit Ns for selected pair)"):
         st.dataframe(diag_df)
 
-    # Append Final-visit MW to RM table for the selected pair (primary endpoint)
+    # Append final-visit MW to RM table for selected pair
     if len(valid_visits) > 0:
         final_visit = valid_visits[-1]
         a_final = long_change[(long_change["Group"]==group_a) & (long_change["Time"]==final_visit)]["Change"].dropna()
@@ -481,12 +514,13 @@ if uploaded:
     else:
         st.info("No valid visits with both groups for pairwise tests; RM summary shown above for all groups.")
 
-    # Within-group tests (all groups)
+    # Within-group tests (all groups present)
     st.subheader("5) Within-group tests (Baseline → each visit, all groups)")
-    within_df = compute_within_group_tests(input_echo if input_echo is not None else pd.DataFrame(), observed or VISITS)
+    within_df = compute_within_group_tests(input_echo if input_echo is not None else pd.DataFrame(),
+                                           observed or VISITS)
     st.dataframe(within_df)
 
-    # Welch t-tests (pairwise, selected pair)
+    # Welch t-tests (pairwise)
     st.subheader(f"6) Welch t-tests on change (pairwise: {group_a} vs {group_b})")
     ttests_df = compute_welch_on_changes(long_change, valid_visits or observed or VISITS, group_a, group_b)
     st.dataframe(ttests_df)
@@ -503,7 +537,8 @@ if uploaded:
     # Build Excel
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        if input_echo is not None: input_echo.to_excel(writer, sheet_name="INPUT_ECHO", index=False)
+        if input_echo is not None and not input_echo.empty:
+            input_echo.to_excel(writer, sheet_name="INPUT_ECHO", index=False)
         change_wide.to_excel(writer, sheet_name="CHANGE_WIDE", index=False)
         summary_df.to_excel(writer, sheet_name="SUMMARY_PAIR", index=False)
         pv_df.to_excel(writer, sheet_name="P_VALUES_PAIR", index=False)
