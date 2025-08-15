@@ -88,17 +88,27 @@ def hodges_lehmann(a, b):
 
 # ---------- Builders ----------
 def build_long_from_input(df, visits):
+    """
+    Returns:
+      long_change (Subject, Group, Time, Change),
+      chg_wide (Subject, Group, DayX_change...),
+      input_echo (Subject, Group, Baseline, DayX raw only),
+      covariates_df (FULL copy with all original columns + normalized Subject/Group),
+      err (str or None)
+    """
     df = df.rename(columns=lambda x: str(x).strip())
     subj = (infer_col(df, ("subject",)) or infer_col(df, ("participant","id")) or
             infer_col(df, ("subject","id")) or infer_col(df, ("id",)) or "Subject")
     grp  = infer_col(df, ("group",)) or "Group"
 
+    # Baseline can be "Baseline", "Baseline IPSS Total Score", etc.
     base = (infer_col(df, ("baseline",)) or infer_col(df, ("base",)) or
             infer_col(df, ("bl_",)) or infer_col(df, ("bl ",)) or
             infer_col(df, (" bl",)) or infer_col(df, ("bl",)))
     if not base:
-        return None, None, None, "Baseline column not found (e.g., 'Baseline IPSS Total Score')."
+        return None, None, None, None, "Baseline column not found (e.g., 'Baseline IPSS Total Score')."
 
+    # Visit columns: match by visit token regardless of metric text
     visit_map = {}
     for v in visits:
         aliases = [v.lower(), v.lower().replace("day","day ")]
@@ -108,22 +118,28 @@ def build_long_from_input(df, visits):
             if any(a in lc for a in aliases):
                 col = c; break
         if not col:
-            return None, None, None, f"Raw column for {v} not found."
+            return None, None, None, None, f"Raw column for {v} not found."
         visit_map[v] = col
 
+    # ---------- covariates copy (FULL) ----------
+    covariates_df = df.copy()
+    covariates_df.rename(columns=lambda x: str(x).strip(), inplace=True)
+    covariates_df["Subject"] = covariates_df[subj].astype(str)
+    covariates_df["Group"]   = covariates_df[grp].astype(str).str.strip()
+
+    # ---------- analysis echo (only baseline + visits) ----------
     inp = df[[subj, grp, base] + list(visit_map.values())].copy()
     inp.columns = ["Subject","Group","Baseline"] + visits
     inp["Group"] = inp["Group"].astype(str).str.strip()
-
-    # numeric
     for c in ["Baseline"] + visits:
         inp[c] = pd.to_numeric(inp[c], errors="coerce")
 
-    # CHANGE_WIDE
+    # change wide
     chg_wide = inp[["Subject","Group"]].copy()
     for v in visits:
         chg_wide[f"{v}_change"] = inp[v] - inp["Baseline"]
 
+    # long
     rows = []
     for _, r in chg_wide.iterrows():
         for vv in visits:
@@ -132,9 +148,9 @@ def build_long_from_input(df, visits):
                 rows.append({"Subject": r["Subject"], "Group": r["Group"], "Time": vv, "Change": float(val)})
     long_change = pd.DataFrame(rows)
     if long_change.empty:
-        return None, None, None, "No change values computed (non-numeric inputs?)."
+        return None, None, None, None, "No change values computed (non-numeric inputs?)."
     long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
-    return long_change, chg_wide, inp, None
+    return long_change, chg_wide, inp, covariates_df, None
 
 def build_long_from_changewide(df, visits):
     df = df.rename(columns=lambda x: str(x).strip())
@@ -177,13 +193,13 @@ def build_long_from_changewide(df, visits):
     long_change["Time"] = pd.Categorical(long_change["Time"], categories=visits, ordered=True)
     return long_change, use, None
 
-# ---------- Filters UI (with debug + robust numeric) ----------
-def build_filter_ui(input_echo, change_wide, visits):
+# ---------- Filters UI (uses FULL covariates frame) ----------
+def build_filter_ui(covariates_df, change_wide, visits):
     """
     Returns: filter_info (list of dict), groups_selected (list), subject_set (set or None).
-    Shows a 'Filter debug' box so you can see what was detected.
+    Shows a 'Filter debug' panel so you can see what was detected.
     """
-    df_cov = input_echo if input_echo is not None and not input_echo.empty else None
+    df_cov = covariates_df if covariates_df is not None and not covariates_df.empty else None
 
     # Which groups are present?
     if df_cov is not None:
@@ -194,8 +210,8 @@ def build_filter_ui(input_echo, change_wide, visits):
         mode = "CHANGE (Change Wide)"
 
     with st.sidebar.expander("Filters (optional)"):
+        # Groups
         groups_selected = st.multiselect("Groups to include", all_groups, default=all_groups)
-
         filter_info = [{"Field": "Group", "Rule": ", ".join(groups_selected) if groups_selected else "(none)"}]
 
         if df_cov is None:
@@ -206,7 +222,7 @@ def build_filter_ui(input_echo, change_wide, visits):
         df = df_cov.copy()
         df["Group"] = df["Group"].astype(str).str.strip()
 
-        # ——— Status (categorical) ———
+        # Status (categorical)
         status_col = find_col(df, "Status")
         status_selected = None
         if status_col is not None:
@@ -215,7 +231,7 @@ def build_filter_ui(input_echo, change_wide, visits):
             if status_selected:
                 filter_info.append({"Field": "Status", "Rule": ", ".join(status_selected)})
 
-        # ——— Numeric covariates ———
+        # Numeric covariates
         numeric_targets = ["Age", "Weight in kg", "Height in metres", "BMI"]
         slider_rules = {}
         detected_cols = {}
@@ -230,7 +246,7 @@ def build_filter_ui(input_echo, change_wide, visits):
                 continue
             lo, hi = float(np.nanmin(num)), float(np.nanmax(num))
             a, b = st.slider(f"{tgt} range", min_value=lo, max_value=hi, value=(lo, hi))
-            df[col] = num  # store cleaned numeric
+            df[col] = num  # cleaned numeric
             slider_rules[col] = (a, b)
             filter_info.append({"Field": tgt, "Rule": f"{a} ≤ {tgt} ≤ {b}"})
 
@@ -240,7 +256,6 @@ def build_filter_ui(input_echo, change_wide, visits):
             mask &= df[status_col].astype(str).str.strip().isin(status_selected)
         for col, (a, b) in slider_rules.items():
             mask &= df[col].between(a, b, inclusive="both")
-
         subject_set = set(df.loc[mask, "Subject"].astype(str))
 
     # Debug panel
@@ -457,7 +472,7 @@ if uploaded:
     except Exception as e:
         st.error(f"Could not read Excel: {e}"); st.stop()
 
-    long_change = None; change_wide = None; input_echo = None
+    long_change = None; change_wide = None; input_echo = None; cov_df = None
     used_mode = None; used_sheet = None
 
     # Try Change Wide first
@@ -475,9 +490,10 @@ if uploaded:
         for s in xl.sheet_names:
             try:
                 df = pd.read_excel(uploaded, sheet_name=s)
-                lc, chg_wide, inp, err = build_long_from_input(df, VISITS)
+                lc, chg_wide, inp, covariates_df, err = build_long_from_input(df, VISITS)
                 if lc is not None and err is None and not lc.empty:
-                    long_change = lc; change_wide = chg_wide; input_echo = inp; used_mode, used_sheet = "RAW", s; break
+                    long_change = lc; change_wide = chg_wide; input_echo = inp; cov_df = covariates_df
+                    used_mode, used_sheet = "RAW", s; break
             except Exception:
                 pass
 
@@ -486,8 +502,8 @@ if uploaded:
 
     st.success(f"Detected: **{used_mode}** on sheet **{used_sheet}**")
 
-    # === Filters ===
-    filter_info, groups_selected, subject_set = build_filter_ui(input_echo, change_wide, VISITS)
+    # === Filters (now pass FULL covariates df) ===
+    filter_info, groups_selected, subject_set = build_filter_ui(cov_df, change_wide, VISITS)
 
     # Apply to data
     def _apply_filters_long(df_long):
